@@ -36,6 +36,7 @@ function makeDeps(opts: { frames?: unknown[]; bridges?: typeof bridge[]; archive
   });
   const streamEvents = vi.fn(async function* () { for (const f of opts.frames ?? []) yield f; });
   const getSession = vi.fn(async (id: string) => ({ id, status: "active" }));
+  const listEvents = vi.fn(async () => ({ events: [], resumeCursor: null }));
   const listSessionsPage = vi.fn(async () => ({ sessions: [], nextCursor: null }));
   const readFile = vi.fn(async (p: string) => {
     if (p === "/srv/alpha/.claude/background/tasks.json") return tasksJson;
@@ -47,7 +48,9 @@ function makeDeps(opts: { frames?: unknown[]; bridges?: typeof bridge[]; archive
     return opts.precheck ?? { code: 0, stdout: "" };
   });
   const deps = {
-    api: { createSession, postUserMessage, archiveSession, streamEvents, getSession, listSessionsPage },
+    api: {
+      createSession, postUserMessage, archiveSession, streamEvents, getSession, listEvents, listSessionsPage,
+    },
     discovery: {}, maxSpawned: 6,
     discover: async () => opts.bridges ?? [bridge],
     readFile,

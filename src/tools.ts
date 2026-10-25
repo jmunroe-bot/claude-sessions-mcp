@@ -296,6 +296,34 @@ function stoppedAnswer(reason: "archived" | "deleted"): {
   };
 }
 
+/** How many of the newest events a wait reads to find where the latest turn stands. */
+const TURN_SCAN_LIMIT = 50;
+
+/**
+ * Where the session's latest turn stands, read newest-first from the event
+ * list. The newest event alone does not tell: a finished session can carry
+ * control and system events after its result (seen live: eight of them, from
+ * a bridge reattach). So the scan goes back to the first `result` or `user`
+ * event. A result means the turn is over; a user event (the prompt, or a tool
+ * result inside the turn) means it is still running. Neither within the scan
+ * is read as running, which at worst waits rather than returning a stale answer.
+ *
+ * `newest` is the sequence number of the newest event, the line a stream
+ * result must be past to belong to the turn being waited on: the stream
+ * replays the full history when opened without Last-Event-ID, results of
+ * long-finished turns included.
+ */
+async function latestTurn(
+  deps: ToolDeps,
+  sessionId: string,
+): Promise<{ result: Record<string, unknown> | null; newest: string | null }> {
+  const { events } = await deps.api.listEvents(sessionId, { limit: TURN_SCAN_LIMIT });
+  const newest = events[0]?.sequence_num ?? null;
+  const boundary = events.find((e) => e.event_type === "result" || e.event_type === "user");
+  const result = boundary?.event_type === "result" ? boundary.payload ?? null : null;
+  return { result, newest };
+}
+
 export async function waitForIdle(
   deps: ToolDeps,
   args: { session_id: string; timeout_s?: number },
@@ -312,6 +340,14 @@ export async function waitForIdle(
     // gone would otherwise be waited on for the full timeout.
     stopped = await sessionStopReason(deps, args.session_id);
     if (stopped) return stoppedAnswer(stopped);
+
+    const latest = await latestTurn(deps, args.session_id);
+    if (latest.result) return { finished: true, outcome: "result", result: toTurnResult(latest.result) };
+    // The stream's frame ids are the events' sequence numbers, so resuming
+    // from the newest one skips the history replay; the sequence check below
+    // still guards against a server that replays anyway.
+    const after = latest.newest === null ? null : Number(latest.newest);
+    lastEventId = latest.newest ?? undefined;
 
     // The stream cannot report an archive, so a poll runs alongside it and
     // aborts the wait when the session stops.
@@ -336,7 +372,13 @@ export async function waitForIdle(
           signal: controller.signal,
         })) {
           if (frame.id) lastEventId = frame.id;
-          const payload = frame.payload as { event_type?: string; payload?: Record<string, unknown> };
+          const payload = frame.payload as {
+            event_type?: string; sequence_num?: string; payload?: Record<string, unknown>;
+          };
+          // A result that is not past the newest event seen before the wait
+          // belongs to an earlier turn.
+          const sequence = Number(payload?.sequence_num ?? frame.id);
+          if (after !== null && !(sequence > after)) continue;
           if (payload?.event_type === "result" && payload.payload) {
             return { finished: true, outcome: "result", result: toTurnResult(payload.payload) };
           }
