@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { ApiError } from "../src/api.js";
 import { spawnSession } from "../src/tools.js";
 import type { ToolDeps } from "../src/tools.js";
 import { SERVER_TAG } from "../src/sessions.js";
@@ -20,10 +21,37 @@ function deps(overrides: {
   maxSpawned?: number;
   postFails?: Error;
   deleteFails?: Error;
+  /** How the worker answers set_permission_mode; "echo" confirms the mode asked for. */
+  modeReply?: "echo" | "silent" | { subtype: string; error?: string; mode?: string };
+  /** Thrown by every stream opened, before anything is yielded. */
+  streamFails?: Error;
 } = {}) {
+  const order: string[] = [];
   const createSession = vi.fn(async () => ({ id: "s-new" }));
   const postUserMessage = vi.fn(async () => {
+    order.push("prompt");
     if (overrides.postFails) throw overrides.postFails;
+  });
+  let pending: { requestId: string; mode: string } | null = null;
+  const postControlRequest = vi.fn(async (_id: string, requestId: string, request: { mode: string }) => {
+    order.push(`control:${request.mode}`);
+    pending = { requestId, mode: request.mode };
+  });
+  const streamEvents = vi.fn(async function* () {
+    if (overrides.streamFails) throw overrides.streamFails;
+    const reply = overrides.modeReply ?? "echo";
+    // An unrelated event and another request's answer come first, as on a live stream.
+    yield { id: "1", payload: { event_type: "env_manager_log", payload: {} } };
+    yield { id: "2", payload: { event_type: "control_response", payload: { response: {
+      request_id: "set-mode-someone-else", subtype: "error", error: "not ours",
+    } } } };
+    if (!pending || reply === "silent") return;
+    const response = reply === "echo"
+      ? { subtype: "success", response: { mode: pending.mode === "manual" ? "default" : pending.mode } }
+      : { subtype: reply.subtype, error: reply.error, ...(reply.mode ? { response: { mode: reply.mode } } : {}) };
+    yield { id: "3", payload: { event_type: "control_response", payload: { response: {
+      request_id: pending.requestId, ...response,
+    } } } };
   });
   const deleteSession = vi.fn(async () => {
     if (overrides.deleteFails) throw overrides.deleteFails;
@@ -38,12 +66,15 @@ function deps(overrides: {
     };
   });
   const toolDeps = {
-    api: { createSession, postUserMessage, deleteSession, listSessionsPage },
+    api: { createSession, postUserMessage, postControlRequest, streamEvents, deleteSession, listSessionsPage },
     discovery: { proc: { list: async () => [] }, readPointers: async () => [] },
     maxSpawned: overrides.maxSpawned ?? 3,
+    modeConfirmMs: 50,
     discover: async () => overrides.instances ?? [overrides.instance ?? instance],
   } as unknown as ToolDeps;
-  return { toolDeps, createSession, postUserMessage, deleteSession, listSessionsPage };
+  return {
+    toolDeps, createSession, postUserMessage, postControlRequest, streamEvents, deleteSession, listSessionsPage, order,
+  };
 }
 
 const spawned = (n: number) =>
@@ -66,6 +97,7 @@ describe("spawn_session", () => {
       permissionMode: "auto",
     });
     expect(postUserMessage).toHaveBeenCalledWith("s-new", "review the diff");
+    expect(result.permission_mode).toBe("auto");
   });
 
   it("rejects bypassPermissions instead of downgrading it", async () => {
@@ -184,5 +216,89 @@ describe("spawn_session", () => {
       tags: [SERVER_TAG, "spawned-by:vector-task", "role:vector-prime"],
       model: "claude-opus-5",
     }));
+  });
+
+  // The bridge ignores config.permission_mode, so the mode is set on the
+  // worker and confirmed before the prompt goes in.
+  describe("permission_mode", () => {
+    it("sets the requested mode on the worker and confirms it before posting the prompt", async () => {
+      const { toolDeps, postControlRequest, order } = deps();
+
+      const result = await spawnSession(toolDeps, { instance: "alpha", prompt: "p", permission_mode: "plan" });
+
+      expect(postControlRequest).toHaveBeenCalledWith(
+        "s-new", expect.stringMatching(/^set-mode-/), { subtype: "set_permission_mode", mode: "plan" },
+      );
+      expect(order).toEqual(["control:plan", "prompt"]);
+      expect(result.permission_mode).toBe("plan");
+    });
+
+    it("sets auto explicitly when no mode is given, rather than trusting the bridge default", async () => {
+      const { toolDeps, postControlRequest } = deps();
+      await spawnSession(toolDeps, { instance: "alpha", prompt: "p" });
+      expect(postControlRequest.mock.calls[0][2]).toEqual({ subtype: "set_permission_mode", mode: "auto" });
+    });
+
+    it("accepts manual, which the worker reports as default", async () => {
+      const { toolDeps } = deps();
+      await expect(spawnSession(toolDeps, { instance: "alpha", prompt: "p", permission_mode: "manual" }))
+        .resolves.toMatchObject({ permission_mode: "manual" });
+    });
+
+    it("fails the spawn and deletes the session when the worker refuses the mode", async () => {
+      const { toolDeps, postUserMessage, deleteSession } = deps({
+        modeReply: { subtype: "error", error: "gate not enabled" },
+      });
+
+      await expect(spawnSession(toolDeps, { instance: "alpha", prompt: "p", permission_mode: "plan" }))
+        .rejects.toThrow(/s-new.*permission_mode "plan" could not be applied.*gate not enabled.*has been deleted/s);
+      expect(postUserMessage).not.toHaveBeenCalled();
+      expect(deleteSession).toHaveBeenCalledWith("s-new");
+    });
+
+    it("fails the spawn when the worker confirms a different mode", async () => {
+      const { toolDeps, postUserMessage } = deps({ modeReply: { subtype: "success", mode: "auto" } });
+
+      await expect(spawnSession(toolDeps, { instance: "alpha", prompt: "p", permission_mode: "plan" }))
+        .rejects.toThrow(/reports mode "auto" instead/);
+      expect(postUserMessage).not.toHaveBeenCalled();
+    });
+
+    it("fails the spawn when the worker never answers, instead of running in an unknown mode", async () => {
+      const { toolDeps, postUserMessage, deleteSession, streamEvents } = deps({ modeReply: "silent" });
+      // Long enough for one reconnect.
+      toolDeps.modeConfirmMs = 1500;
+
+      await expect(spawnSession(toolDeps, { instance: "alpha", prompt: "p", permission_mode: "plan" }))
+        .rejects.toThrow(/did not confirm it within/);
+      expect(postUserMessage).not.toHaveBeenCalled();
+      expect(deleteSession).toHaveBeenCalledWith("s-new");
+      // A stream that ends without the answer is reopened, not given up on.
+      expect(streamEvents.mock.calls.length).toBeGreaterThan(1);
+    });
+
+    it("does not retry a stream the API rejects as a bad request", async () => {
+      const { toolDeps, streamEvents, deleteSession } = deps({
+        streamFails: new ApiError("stream s-new failed (404)", 404, null),
+      });
+
+      await expect(spawnSession(toolDeps, { instance: "alpha", prompt: "p", permission_mode: "plan" }))
+        .rejects.toThrow(/could not be applied.*404/s);
+      expect(streamEvents).toHaveBeenCalledOnce();
+      expect(deleteSession).toHaveBeenCalledWith("s-new");
+    });
+
+    it("reconnects after a dropped stream and still confirms the mode", async () => {
+      const { toolDeps, streamEvents, order } = deps();
+      const real = streamEvents.getMockImplementation()!;
+      streamEvents.mockImplementationOnce(async function* () { throw new Error("socket hang up"); });
+      streamEvents.mockImplementation(real);
+      toolDeps.modeConfirmMs = 5000;
+
+      await spawnSession(toolDeps, { instance: "alpha", prompt: "p", permission_mode: "acceptEdits" });
+
+      expect(streamEvents).toHaveBeenCalledTimes(2);
+      expect(order).toEqual(["control:acceptEdits", "prompt"]);
+    });
   });
 });

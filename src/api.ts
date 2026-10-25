@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { TokenReader } from "./credentials.js";
 import { parseSse } from "./stream.js";
 
@@ -143,6 +144,27 @@ export class SessionsApi {
         events: [{
           event_type: "user_message",
           payload: { type: "user", message: { role: "user", content: text } },
+        }],
+      }),
+    });
+  }
+
+  /**
+   * A control request for the session's worker, in the shape Claude Code's own
+   * remote client posts. One sent before the worker connects is queued and
+   * delivered when it does; the worker's answer comes back on the event stream
+   * as a `control_response` carrying the same request_id.
+   */
+  async postControlRequest(
+    sessionId: string,
+    requestId: string,
+    request: Record<string, unknown>,
+  ): Promise<void> {
+    await this.request(`/${sessionId}/events`, {
+      method: "POST",
+      body: JSON.stringify({
+        events: [{
+          payload: { type: "control_request", request_id: requestId, request, uuid: randomUUID() },
         }],
       }),
     });

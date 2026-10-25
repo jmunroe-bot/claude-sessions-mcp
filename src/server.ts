@@ -70,7 +70,9 @@ export function buildServer(deps: ToolDeps): McpServer {
       "Start a new Claude Code session inside a running bridge and give it a first prompt. " +
       "The session belongs to that bridge: its worker runs under the bridge process and it " +
       "appears in the session list like any other. Effort defaults to medium; " +
-      `permission_mode is one of ${ALLOWED_PERMISSION_MODES.join(", ")} (bypassPermissions is refused).`,
+      `permission_mode is one of ${ALLOWED_PERMISSION_MODES.join(", ")} (bypassPermissions is refused) ` +
+      "and defaults to auto. The mode is confirmed by the worker before the prompt is posted; " +
+      "if it cannot be applied the session is deleted and the call fails.",
     inputSchema: toolInput({
       instance: z.string(),
       prompt: z.string(),

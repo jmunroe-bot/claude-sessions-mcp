@@ -130,6 +130,12 @@ real one, as a guard against a precheck that wrongly reports no work.
 
 - `permission_mode` accepts `auto`, `acceptEdits`, `plan`, `manual` or
   `dontAsk` only. `bypassPermissions` is refused outright, never downgraded.
+- Bridge workers ignore the permission mode in the create call and start in the
+  bridge host's `defaultMode`, so `spawn_session` sets the mode (`auto` when none
+  is given) on the worker with a `set_permission_mode` control request and waits
+  for the worker to confirm it before posting the prompt. If the worker refuses,
+  reports another mode or does not answer within 60s, the session is deleted and
+  the spawn fails; it never runs in a mode other than the one asked for.
 - Sessions can be spawned only in bridges discovered on this machine, never in
   a raw environment id.
 - `CLAUDE_SESSIONS_MCP_MAX_SPAWNED` bounds how many active sessions this server

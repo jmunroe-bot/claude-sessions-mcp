@@ -34,7 +34,18 @@ function makeDeps(opts: { frames?: unknown[]; bridges?: typeof bridge[]; archive
     if (opts.archiveFails) throw new Error("archive down");
     return { id, status: "archived", tags: [] };
   });
-  const streamEvents = vi.fn(async function* () { for (const f of opts.frames ?? []) yield f; });
+  // The worker's answer to the spawn's set_permission_mode comes first on the
+  // next stream opened; the task's own frames after it.
+  const modeReplies: unknown[] = [];
+  const postControlRequest = vi.fn(async (_id: string, requestId: string, request: { mode: string }) => {
+    modeReplies.push({ payload: { event_type: "control_response", payload: { response: {
+      request_id: requestId, subtype: "success", response: { mode: request.mode },
+    } } } });
+  });
+  const streamEvents = vi.fn(async function* () {
+    if (modeReplies.length > 0) { yield* modeReplies.splice(0); return; }
+    for (const f of opts.frames ?? []) yield f;
+  });
   const getSession = vi.fn(async (id: string) => ({ id, status: "active" }));
   const listEvents = vi.fn(async () => ({ events: [], resumeCursor: null }));
   const listSessionsPage = vi.fn(async () => ({ sessions: [], nextCursor: null }));
@@ -49,7 +60,8 @@ function makeDeps(opts: { frames?: unknown[]; bridges?: typeof bridge[]; archive
   });
   const deps = {
     api: {
-      createSession, postUserMessage, archiveSession, streamEvents, getSession, listEvents, listSessionsPage,
+      createSession, postUserMessage, postControlRequest, archiveSession, streamEvents, getSession, listEvents,
+      listSessionsPage,
     },
     discovery: {}, maxSpawned: 6,
     discover: async () => opts.bridges ?? [bridge],

@@ -65,6 +65,24 @@ describe("SessionsApi", () => {
     });
   });
 
+  it("posts a control request in the payload-only envelope Claude Code's remote client uses", async () => {
+    const fetchImpl = vi.fn(async () => json({ results: [] }));
+    const api = new SessionsApi({ token, fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await api.postControlRequest("s-1", "set-mode-1", { subtype: "set_permission_mode", mode: "plan" });
+
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://api.anthropic.com/v1/code/sessions/s-1/events");
+    expect(JSON.parse(init.body as string)).toEqual({
+      events: [{ payload: {
+        type: "control_request",
+        request_id: "set-mode-1",
+        request: { subtype: "set_permission_mode", mode: "plan" },
+        uuid: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      } }],
+    });
+  });
+
   it("reconnects a session to its bridge on the environments API with its beta", async () => {
     const fetchImpl = vi.fn(async () => json({ environment_id: "env-1" }));
     const api = new SessionsApi({ token, fetchImpl: fetchImpl as unknown as typeof fetch });
