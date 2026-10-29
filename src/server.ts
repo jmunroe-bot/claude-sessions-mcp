@@ -38,6 +38,16 @@ export function loadConfig(env: NodeJS.ProcessEnv): ServerConfig {
   };
 }
 
+/**
+ * Tool arguments as a zod object that still advertises
+ * `additionalProperties: false`. Zod 3's converter emitted it for every plain
+ * object; zod 4's toJSONSchema leaves it out for input schemas, which would
+ * loosen the published tools/list. The meta key restores the published schema
+ * while parsing keeps zod's default of stripping unknown keys, as before.
+ */
+const toolInput = <Shape extends z.ZodRawShape>(shape: Shape) =>
+  z.object(shape).meta({ additionalProperties: false });
+
 const asJson = (value: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }],
 });
@@ -52,7 +62,7 @@ export function buildServer(deps: ToolDeps): McpServer {
 
   server.registerTool("list_sessions", {
     description: "Sessions of one bridge, or of every bridge when no instance is named.",
-    inputSchema: { instance: z.string().optional() },
+    inputSchema: toolInput({ instance: z.string().optional() }),
   }, async (args) => asJson(await listSessions(deps, args)));
 
   server.registerTool("spawn_session", {
@@ -61,29 +71,29 @@ export function buildServer(deps: ToolDeps): McpServer {
       "The session belongs to that bridge: its worker runs under the bridge process and it " +
       "appears in the session list like any other. Effort defaults to medium; " +
       `permission_mode is one of ${ALLOWED_PERMISSION_MODES.join(", ")} (bypassPermissions is refused).`,
-    inputSchema: {
+    inputSchema: toolInput({
       instance: z.string(),
       prompt: z.string(),
       title: z.string().optional(),
       effort: z.enum(["low", "medium", "high", "xhigh", "max"]).optional(),
       permission_mode: z.string().optional(),
       caller: z.string().optional().describe("Who is asking, recorded on the session as spawned-by"),
-    },
+    }),
   }, async (args) => asJson(await spawnSession(deps, args)));
 
   server.registerTool("send_message", {
     description: "Send a message to a live session, as if typed by its user.",
-    inputSchema: { session_id: z.string(), text: z.string() },
+    inputSchema: toolInput({ session_id: z.string(), text: z.string() }),
   }, async (args) => asJson(await sendMessage(deps, args)));
 
   server.registerTool("read_session", {
     description: "Recent events of a session, condensed to the conversation. Pass verbose for the machinery, cursor to continue.",
-    inputSchema: {
+    inputSchema: toolInput({
       session_id: z.string(),
       limit: z.number().int().positive().max(200).optional(),
       cursor: z.string().optional(),
       verbose: z.boolean().optional(),
-    },
+    }),
   }, async (args) => asJson(await readSession(deps, args)));
 
   server.registerTool("wait_for_idle", {
@@ -92,22 +102,22 @@ export function buildServer(deps: ToolDeps): McpServer {
       "stop reason, permission denials and cost. Returns an `outcome` saying why the wait ended: " +
       "`result` when the turn finished, `archived` or `deleted` when the session stopped and no " +
       "result can arrive, `timeout` when it is still working.",
-    inputSchema: { session_id: z.string(), timeout_s: z.number().int().positive().max(3600).optional() },
+    inputSchema: toolInput({ session_id: z.string(), timeout_s: z.number().int().positive().max(3600).optional() }),
   }, async (args) => asJson(await waitForIdle(deps, args)));
 
   server.registerTool("archive_session", {
     description: "Stop a session and free its slot on the bridge, keeping its history.",
-    inputSchema: { session_id: z.string() },
+    inputSchema: toolInput({ session_id: z.string() }),
   }, async (args) => asJson(await archiveSession(deps, args)));
 
   server.registerTool("unarchive_session", {
     description: "Return an archived session to active. This does NOT restart its worker — a client has to open the session for it to run again.",
-    inputSchema: { session_id: z.string() },
+    inputSchema: toolInput({ session_id: z.string() }),
   }, async (args) => asJson(await unarchiveSession(deps, args)));
 
   server.registerTool("delete_session", {
     description: "Delete a session and stop its worker.",
-    inputSchema: { session_id: z.string() },
+    inputSchema: toolInput({ session_id: z.string() }),
   }, async (args) => asJson(await deleteSession(deps, args)));
 
   return server;
