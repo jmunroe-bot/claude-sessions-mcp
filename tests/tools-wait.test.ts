@@ -14,14 +14,33 @@ const resultEvent = {
   },
 };
 
+/** A session event as the list endpoint returns it. */
+function listed(sequence: number, eventType: string, payload: Record<string, unknown> = {}) {
+  return { sequence_num: String(sequence), event_type: eventType, payload };
+}
+
+/** A stream frame carrying a result, numbered the way the live API numbers it. */
+function resultFrame(sequence: number, text: string) {
+  return {
+    id: String(sequence), event: "client_event",
+    payload: {
+      sequence_num: String(sequence), event_type: "result",
+      payload: { ...resultEvent.payload.payload, result: text },
+    },
+  };
+}
+
 function depsWithStream(
   frames: unknown[][],
   /** Session status per getSession call; the last entry repeats. */
   statuses: string[] = ["active"],
+  /** What listEvents returns, newest first, as the live API orders it. */
+  events: unknown[] = [],
 ): {
   toolDeps: ToolDeps;
   streamEvents: ReturnType<typeof vi.fn>;
   getSession: ReturnType<typeof vi.fn>;
+  listEvents: ReturnType<typeof vi.fn>;
 } {
   let call = 0;
   const streamEvents = vi.fn(async function* (_id: string, _opts: { lastEventId?: string }) {
@@ -34,10 +53,16 @@ function depsWithStream(
     statusCall += 1;
     return { id, status };
   });
+  const listEvents = vi.fn(async (_id: string, _opts: { limit?: number }) => ({
+    events, resumeCursor: null,
+  }));
   return {
-    toolDeps: { api: { streamEvents, getSession }, discovery: {}, maxSpawned: 3 } as unknown as ToolDeps,
+    toolDeps: {
+      api: { streamEvents, getSession, listEvents }, discovery: {}, maxSpawned: 3,
+    } as unknown as ToolDeps,
     streamEvents,
     getSession,
+    listEvents,
   };
 }
 
@@ -105,6 +130,43 @@ describe("wait_for_idle", () => {
     });
   });
 
+  it("skips a replayed result from an earlier turn and returns the current one", async () => {
+    // Mid-turn: the newest events are the new prompt and the work on it. The
+    // stream replays the whole history, earlier turn's result included.
+    const { toolDeps, streamEvents } = depsWithStream([[
+      resultFrame(12, "first turn"),
+      { id: "19", event: "client_event", payload: { sequence_num: "19", event_type: "user", payload: {} } },
+      { id: "20", event: "client_event", payload: { sequence_num: "20", event_type: "assistant", payload: {} } },
+      { id: "21", event: "client_event", payload: { sequence_num: "21", event_type: "assistant", payload: {} } },
+      resultFrame(22, "second turn"),
+    ]], ["active"], [
+      listed(20, "assistant"), listed(19, "user"), listed(18, "system"), listed(12, "result"),
+    ]);
+
+    const outcome = await waitForIdle(toolDeps, { session_id: "s-1", timeout_s: 5 });
+
+    expect(outcome).toMatchObject({ finished: true, outcome: "result" });
+    expect(outcome.result?.text).toBe("second turn");
+    // Resumed from the newest event, so a server that honours it skips the replay.
+    expect(streamEvents.mock.calls[0][1]).toMatchObject({ lastEventId: "20" });
+  });
+
+  it("returns the latest result at once when the session is already idle", async () => {
+    // As seen live: control and system events can follow the last result.
+    const { toolDeps, streamEvents } = depsWithStream([], ["active"], [
+      listed(30, "control_response"), listed(29, "control_request"), listed(28, "system"),
+      listed(27, "result", { ...resultEvent.payload.payload, result: "latest turn" }),
+      listed(26, "assistant"), listed(25, "user"),
+      listed(12, "result", { ...resultEvent.payload.payload, result: "first turn" }),
+    ]);
+
+    const outcome = await waitForIdle(toolDeps, { session_id: "s-1", timeout_s: 60 });
+
+    expect(outcome).toMatchObject({ finished: true, outcome: "result" });
+    expect(outcome.result?.text).toBe("latest turn");
+    expect(streamEvents).not.toHaveBeenCalled();
+  });
+
   it("reconnects from the last seen id when the stream ends early", async () => {
     const { toolDeps, streamEvents } = depsWithStream([
       [{ id: "5", event: "client_event", payload: { event_type: "assistant", payload: {} } }],
@@ -168,7 +230,8 @@ describe("wait_for_idle", () => {
       yield resultEvent;
     });
     const toolDeps = {
-      api: { streamEvents }, discovery: {}, maxSpawned: 3,
+      api: { streamEvents, listEvents: async () => ({ events: [], resumeCursor: null }) },
+      discovery: {}, maxSpawned: 3,
     } as unknown as ToolDeps;
 
     vi.useFakeTimers();
@@ -189,7 +252,8 @@ describe("wait_for_idle", () => {
       throw new ApiError("no such session", 404, null);
     });
     const toolDeps = {
-      api: { streamEvents }, discovery: {}, maxSpawned: 3,
+      api: { streamEvents, listEvents: async () => ({ events: [], resumeCursor: null }) },
+      discovery: {}, maxSpawned: 3,
     } as unknown as ToolDeps;
 
     await expect(waitForIdle(toolDeps, { session_id: "s-1", timeout_s: 5 }))

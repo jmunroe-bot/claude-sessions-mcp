@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { ApiError, type SessionsApi } from "./api.js";
 import { discoverInstances, type DiscoveryDeps } from "./discovery.js";
 import { SERVER_TAG, condenseEvents, toSummary, toTurnResult } from "./sessions.js";
@@ -9,6 +10,8 @@ export interface ToolDeps {
   maxSpawned: number;
   /** Seam for tests; production passes discoverInstances over `discovery`. */
   discover?: (deps: DiscoveryDeps) => Promise<BridgeInstance[]>;
+  /** How long a new worker gets to confirm its permission mode; seam for tests. */
+  modeConfirmMs?: number;
 }
 
 async function instances(deps: ToolDeps): Promise<BridgeInstance[]> {
@@ -69,6 +72,71 @@ export const ALLOWED_PERMISSION_MODES = [
   "auto", "acceptEdits", "plan", "manual", "dontAsk",
 ] as const;
 
+/** Measured: a new worker answers about 5s after the session is created. */
+const MODE_CONFIRM_MS = 60_000;
+
+/**
+ * Puts a new session's worker into `mode` and waits for the worker to say so.
+ *
+ * A bridge worker ignores `config.permission_mode` from the create call and
+ * starts in the bridge host's settings `defaultMode` (seen live: a session
+ * created with plan came up in auto). Claude Code's own remote client sets the
+ * mode the same way as here, with a set_permission_mode control request. Sent
+ * before the prompt and confirmed before it is posted, the mode is in force
+ * before the first turn starts. Throws unless the worker confirms it.
+ */
+async function applyPermissionMode(deps: ToolDeps, sessionId: string, mode: string): Promise<void> {
+  const requestId = `set-mode-${randomUUID()}`;
+  // The worker reports manual under its internal name.
+  const expected = mode === "manual" ? "default" : mode;
+  const timeoutMs = deps.modeConfirmMs ?? MODE_CONFIRM_MS;
+  const deadline = Date.now() + timeoutMs;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let lastEventId: string | undefined;
+
+  try {
+    await deps.api.postControlRequest(sessionId, requestId, { subtype: "set_permission_mode", mode });
+    // Set from the worker's answer; thrown outside the stream loop so that a
+    // refusal is never mistaken for a dropped connection.
+    let refusal: string | null = null;
+    let confirmed = false;
+    while (Date.now() < deadline) {
+      try {
+        for await (const frame of deps.api.streamEvents(sessionId, { lastEventId, signal: controller.signal })) {
+          if (frame.id) lastEventId = frame.id;
+          const event = frame.payload as { event_type?: string; payload?: Record<string, unknown> };
+          if (event?.event_type !== "control_response") continue;
+          const response = event.payload?.response as {
+            request_id?: string; subtype?: string; error?: string; response?: { mode?: string };
+          } | undefined;
+          if (response?.request_id !== requestId) continue;
+          const applied = response.response?.mode;
+          if (response.subtype !== "success") refusal = `the worker refused it: ${response.error ?? "no reason given"}`;
+          else if (applied !== undefined && applied !== expected) refusal = `the worker reports mode "${applied}" instead`;
+          else confirmed = true;
+          break;
+        }
+      } catch (error) {
+        if (controller.signal.aborted) break;
+        // As in waitForIdle: a 4xx other than 429 will not heal on reconnect;
+        // anything else is a dropped stream.
+        if (error instanceof ApiError && error.status !== 429 && error.status >= 400 && error.status < 500) {
+          throw error;
+        }
+      }
+      if (confirmed || refusal !== null || controller.signal.aborted) break;
+      await sleep(Math.min(RECONNECT_DELAY_MS, Math.max(0, deadline - Date.now())), controller.signal);
+    }
+    if (confirmed) return;
+    if (refusal !== null) throw new Error(refusal);
+    throw new Error(`the worker did not confirm it within ${Math.round(timeoutMs / 1000)}s`);
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
+  }
+}
+
 const DEFAULT_EFFORT = "medium";
 const TITLE_LIMIT = 60;
 
@@ -120,7 +188,7 @@ export async function spawnSession(
     tags?: string[];
     model?: string;
   },
-): Promise<{ session_id: string; instance: string; title: string }> {
+): Promise<{ session_id: string; instance: string; title: string; permission_mode: string }> {
   const mode = args.permission_mode ?? "auto";
   if (!ALLOWED_PERMISSION_MODES.includes(mode as (typeof ALLOWED_PERMISSION_MODES)[number])) {
     throw new Error(
@@ -158,11 +226,9 @@ export async function spawnSession(
   });
 
   // createSession has already started the worker and taken both a bridge slot
-  // and a ceiling slot. If the prompt cannot be posted the caller never learns
-  // the id, so nothing else could ever clean the session up.
-  try {
-    await deps.api.postUserMessage(created.id, args.prompt);
-  } catch (error) {
+  // and a ceiling slot. If a step below fails the caller never learns the id,
+  // so nothing else could ever clean the session up.
+  const abandon = async (what: string, error: unknown): Promise<never> => {
     const reason = error instanceof Error ? error.message : String(error);
     let cleanup: string;
     try {
@@ -173,13 +239,27 @@ export async function spawnSession(
       cleanup = `Deleting it also failed (${deleteReason}) — it is still running and must be removed by hand.`;
     }
     throw new Error(
-      `Session ${created.id} was created in "${bridge.name}" but its first prompt could not be ` +
-      `posted (${reason}). ${cleanup}`,
+      `Session ${created.id} was created in "${bridge.name}" but ${what} (${reason}). ${cleanup}`,
       { cause: error },
     );
+  };
+
+  // Confirmed before the prompt is posted, so the first turn already runs in
+  // the requested mode. A mode that does not take fails the spawn rather than
+  // leaving the session in the bridge's default, which may be less restrictive.
+  try {
+    await applyPermissionMode(deps, created.id, mode);
+  } catch (error) {
+    await abandon(`permission_mode "${mode}" could not be applied`, error);
   }
 
-  return { session_id: created.id, instance: bridge.name, title };
+  try {
+    await deps.api.postUserMessage(created.id, args.prompt);
+  } catch (error) {
+    await abandon("its first prompt could not be posted", error);
+  }
+
+  return { session_id: created.id, instance: bridge.name, title, permission_mode: mode };
 }
 
 /** A session that is live but has no worker on any bridge right now. */
@@ -296,6 +376,34 @@ function stoppedAnswer(reason: "archived" | "deleted"): {
   };
 }
 
+/** How many of the newest events a wait reads to find where the latest turn stands. */
+const TURN_SCAN_LIMIT = 50;
+
+/**
+ * Where the session's latest turn stands, read newest-first from the event
+ * list. The newest event alone does not tell: a finished session can carry
+ * control and system events after its result (seen live: eight of them, from
+ * a bridge reattach). So the scan goes back to the first `result` or `user`
+ * event. A result means the turn is over; a user event (the prompt, or a tool
+ * result inside the turn) means it is still running. Neither within the scan
+ * is read as running, which at worst waits rather than returning a stale answer.
+ *
+ * `newest` is the sequence number of the newest event, the line a stream
+ * result must be past to belong to the turn being waited on: the stream
+ * replays the full history when opened without Last-Event-ID, results of
+ * long-finished turns included.
+ */
+async function latestTurn(
+  deps: ToolDeps,
+  sessionId: string,
+): Promise<{ result: Record<string, unknown> | null; newest: string | null }> {
+  const { events } = await deps.api.listEvents(sessionId, { limit: TURN_SCAN_LIMIT });
+  const newest = events[0]?.sequence_num ?? null;
+  const boundary = events.find((e) => e.event_type === "result" || e.event_type === "user");
+  const result = boundary?.event_type === "result" ? boundary.payload ?? null : null;
+  return { result, newest };
+}
+
 export async function waitForIdle(
   deps: ToolDeps,
   args: { session_id: string; timeout_s?: number },
@@ -312,6 +420,14 @@ export async function waitForIdle(
     // gone would otherwise be waited on for the full timeout.
     stopped = await sessionStopReason(deps, args.session_id);
     if (stopped) return stoppedAnswer(stopped);
+
+    const latest = await latestTurn(deps, args.session_id);
+    if (latest.result) return { finished: true, outcome: "result", result: toTurnResult(latest.result) };
+    // The stream's frame ids are the events' sequence numbers, so resuming
+    // from the newest one skips the history replay; the sequence check below
+    // still guards against a server that replays anyway.
+    const after = latest.newest === null ? null : Number(latest.newest);
+    lastEventId = latest.newest ?? undefined;
 
     // The stream cannot report an archive, so a poll runs alongside it and
     // aborts the wait when the session stops.
@@ -336,7 +452,13 @@ export async function waitForIdle(
           signal: controller.signal,
         })) {
           if (frame.id) lastEventId = frame.id;
-          const payload = frame.payload as { event_type?: string; payload?: Record<string, unknown> };
+          const payload = frame.payload as {
+            event_type?: string; sequence_num?: string; payload?: Record<string, unknown>;
+          };
+          // A result that is not past the newest event seen before the wait
+          // belongs to an earlier turn.
+          const sequence = Number(payload?.sequence_num ?? frame.id);
+          if (after !== null && !(sequence > after)) continue;
           if (payload?.event_type === "result" && payload.payload) {
             return { finished: true, outcome: "result", result: toTurnResult(payload.payload) };
           }
