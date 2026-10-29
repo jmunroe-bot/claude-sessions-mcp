@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -17,11 +17,30 @@ describe("createTokenReader", () => {
     expect(await reader.read()).toBe("token-1");
   });
 
+  // Two writes a few milliseconds apart can share an mtime, because the kernel
+  // stamps files from a coarse clock. The tests set mtimes explicitly so they
+  // exercise the cache rather than race that clock. Whole seconds, because a
+  // Date cannot carry the sub-millisecond part of mtimeMs back to the file.
+  const earlier = new Date("2026-01-01T00:00:00Z");
+  const later = new Date("2026-01-01T00:00:01Z");
+
   it("serves the cached token without re-reading an unchanged file", async () => {
     const path = await credentialsFile("token-1");
+    await utimes(path, earlier, earlier);
     const reader = createTokenReader(path);
     expect(await reader.read()).toBe("token-1");
     await writeFile(path, JSON.stringify({ claudeAiOauth: { accessToken: "token-2" } }));
+    await utimes(path, earlier, earlier);
+    expect(await reader.read()).toBe("token-1"); // same mtime, so the cache answers
+  });
+
+  it("re-reads the file once its mtime changes", async () => {
+    const path = await credentialsFile("token-1");
+    await utimes(path, earlier, earlier);
+    const reader = createTokenReader(path);
+    expect(await reader.read()).toBe("token-1");
+    await writeFile(path, JSON.stringify({ claudeAiOauth: { accessToken: "token-2" } }));
+    await utimes(path, later, later);
     expect(await reader.read()).toBe("token-2"); // mtime changed, so the cache yields
   });
 
