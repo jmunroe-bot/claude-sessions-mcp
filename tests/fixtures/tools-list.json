@@ -1,0 +1,215 @@
+[
+  {
+    "description": "Remote Control bridges running on this machine, with their environment ids and how many workers each has in use.",
+    "execution": {
+      "taskSupport": "forbidden"
+    },
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "properties": {},
+      "type": "object"
+    },
+    "name": "list_instances"
+  },
+  {
+    "description": "Sessions of one bridge, or of every bridge when no instance is named.",
+    "execution": {
+      "taskSupport": "forbidden"
+    },
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_sessions"
+  },
+  {
+    "description": "Start a new Claude Code session inside a running bridge and give it a first prompt. The session belongs to that bridge: its worker runs under the bridge process and it appears in the session list like any other. Effort defaults to medium; permission_mode is one of auto, acceptEdits, plan, manual, dontAsk (bypassPermissions is refused).",
+    "execution": {
+      "taskSupport": "forbidden"
+    },
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "caller": {
+          "description": "Who is asking, recorded on the session as spawned-by",
+          "type": "string"
+        },
+        "effort": {
+          "enum": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "type": "string"
+        },
+        "instance": {
+          "type": "string"
+        },
+        "permission_mode": {
+          "type": "string"
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "instance",
+        "prompt"
+      ],
+      "type": "object"
+    },
+    "name": "spawn_session"
+  },
+  {
+    "description": "Send a message to a live session, as if typed by its user.",
+    "execution": {
+      "taskSupport": "forbidden"
+    },
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "text"
+      ],
+      "type": "object"
+    },
+    "name": "send_message"
+  },
+  {
+    "description": "Recent events of a session, condensed to the conversation. Pass verbose for the machinery, cursor to continue.",
+    "execution": {
+      "taskSupport": "forbidden"
+    },
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "cursor": {
+          "type": "string"
+        },
+        "limit": {
+          "exclusiveMinimum": 0,
+          "maximum": 200,
+          "type": "integer"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "verbose": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "read_session"
+  },
+  {
+    "description": "Wait on the session's event stream until its current turn finishes, then return the answer, stop reason, permission denials and cost. Returns an `outcome` saying why the wait ended: `result` when the turn finished, `archived` or `deleted` when the session stopped and no result can arrive, `timeout` when it is still working.",
+    "execution": {
+      "taskSupport": "forbidden"
+    },
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string"
+        },
+        "timeout_s": {
+          "exclusiveMinimum": 0,
+          "maximum": 3600,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "wait_for_idle"
+  },
+  {
+    "description": "Stop a session and free its slot on the bridge, keeping its history.",
+    "execution": {
+      "taskSupport": "forbidden"
+    },
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "archive_session"
+  },
+  {
+    "description": "Return an archived session to active. This does NOT restart its worker — a client has to open the session for it to run again.",
+    "execution": {
+      "taskSupport": "forbidden"
+    },
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "unarchive_session"
+  },
+  {
+    "description": "Delete a session and stop its worker.",
+    "execution": {
+      "taskSupport": "forbidden"
+    },
+    "inputSchema": {
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "additionalProperties": false,
+      "properties": {
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "name": "delete_session"
+  }
+]
